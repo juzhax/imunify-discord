@@ -1,0 +1,13 @@
+# Never commit live deployment configuration or backups.
+.env
+*.env
+!config.example.env
+webhook
+webhook.*
+config.env
+*.bak
+*.backup
+*rollback*
+__pycache__/
+*.py[cod]
+.DS_Store

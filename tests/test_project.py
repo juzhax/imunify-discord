@@ -137,7 +137,7 @@ finally:
 
     def test_hostname_mentions_and_private_event(self):
         with patch.object(alert.socket, 'gethostname', return_value='host.example.invalid'):
-            data = alert.payload({'secret': 'must-not-be-forwarded'})
+            data = alert.payload(alert.normalize({'secret': 'must-not-be-forwarded'}))
         self.assertEqual(data['username'], 'host.example.invalid')
         self.assertEqual(data['allowed_mentions'], {'parse': []})
         self.assertNotIn('must-not-be-forwarded', json.dumps(data))
@@ -189,19 +189,21 @@ finally:
         self.assertEqual(manage.registration(untouched, remove=True), untouched)
 
     def test_cli_uses_partial_update_and_checks_readback(self):
-        target = {'enabled': True, 'scripts': ['/opt/other', manage.HOOK]}
+        targets = {event: {'enabled': True, 'scripts': ['/opt/other', manage.HOOK]} for event in manage.EVENTS}
         calls = []
         def fake(args, **kwargs):
             calls.append(args)
-            return subprocess.CompletedProcess(args, 0, json.dumps({'items': {'rules': {manage.EVENT: {'SCRIPT': target}}}}))
+            return subprocess.CompletedProcess(args, 0, json.dumps({'items': {'rules': {
+                event: {'SCRIPT': target} for event, target in targets.items()}}}))
         with patch.object(manage, 'command', side_effect=fake):
-            manage.update('/usr/bin/imunify-antivirus', target)
+            manage.update('/usr/bin/imunify-antivirus', targets)
         self.assertEqual(calls[0][1:3], ['notifications-config', 'update'])
-        self.assertEqual(json.loads(calls[0][3]), {'rules': {manage.EVENT: {'SCRIPT': target}}})
-        with patch.object(manage, 'command', side_effect=fake), \
-             patch.object(manage, 'show', return_value={'enabled': False, 'scripts': []}):
+        self.assertEqual(json.loads(calls[0][3]), {'rules': {event: {'SCRIPT': target} for event, target in targets.items()}})
+        broken = copy.deepcopy(targets)
+        broken[manage.EVENTS[1]]['enabled'] = False
+        with patch.object(manage, 'command', side_effect=fake), patch.object(manage, 'show', return_value=broken):
             with self.assertRaises(RuntimeError):
-                manage.update('agent', target)
+                manage.update('agent', targets)
 
     def test_legacy_cron_migration(self):
         text = '# keep\n0 3 * * * /usr/bin/imunify-antivirus malware on-demand start --path=/home\n0 1 * * * /usr/bin/backup\n'
@@ -238,14 +240,14 @@ finally:
 
 
 class DeploymentTests(unittest.TestCase):
-    def exercise_deployment(self, fail=False, prompt=False, migrate=False):
+    def exercise_deployment(self, fail=False, prompt=False, migrate=False, preserve_cron=False):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             root = base / 'config'
             root.mkdir()
             # Intentionally synthetic credentials, never contact Discord.
             secret = 'https://discord.com/api/webhooks/123/synthetic_test_value\n'
-            (root / 'webhook').write_text(secret)
+            (root / 'webhook').write_text(secret.rstrip('\n'))
             if prompt:
                 (root / 'webhook').unlink()
             (root / 'alert.py').write_text('old script')
@@ -260,21 +262,21 @@ class DeploymentTests(unittest.TestCase):
             legacy_original = legacy_remaining + LEGACY_JOB.replace('0 3 * * *', '0 3 * * 1').replace('--path /home', '--path ' + tmp).replace('--intensity-cpu 2', '--intensity-cpu 1').replace('--intensity-io 2', '--intensity-io 3')
             if migrate:
                 legacy.write_text(legacy_original)
-            state = {'target': {'enabled': True, 'scripts': ['/opt/other', manage.HOOK, manage.HOOK]}}
+            state = {'target': {event: {'enabled': event == manage.EVENT, 'scripts': ['/opt/other', manage.HOOK, manage.HOOK]} for event in manage.EVENTS}}
             original_target = copy.deepcopy(state['target'])
             def fake_command(args, **kwargs):
                 if args[1:3] == ['notifications-config', 'show']:
                     return subprocess.CompletedProcess(args, 0, json.dumps({'items': {'rules': {
-                        manage.EVENT: {'SCRIPT': state['target']}}}}), '')
+                        event: {'SCRIPT': target} for event, target in state['target'].items()}}}), '')
                 if args[1:3] == ['notifications-config', 'update']:
-                    state['target'] = json.loads(args[3])['rules'][manage.EVENT]['SCRIPT']
+                    state['target'] = {event: value['SCRIPT'] for event, value in json.loads(args[3])['rules'].items()}
                     return subprocess.CompletedProcess(args, 0, '', '')
                 if args == ['crontab', '-l']:
                     return subprocess.CompletedProcess(args, 0, '0 1 * * * /usr/bin/backup\n', '')
                 raise AssertionError(args)
-            user = type('User', (), {'pw_name': '_imunify', 'pw_uid': 100, 'pw_gid': 100})()
+            user = type('User', (), {'pw_name': '_imunify', 'pw_uid': os.getuid(), 'pw_gid': os.getgid()})()
             args = type('Args', (), {'notification_user': None, 'update': not prompt,
-                                    'migrate_cron': str(legacy) if migrate else None})()
+                                    'refresh_cron': not preserve_cron, 'migrate_cron': str(legacy) if migrate else None})()
             original_write = manage.write
             failed = False
             def maybe_fail(path, *args, **kwargs):
@@ -284,13 +286,14 @@ class DeploymentTests(unittest.TestCase):
                     raise OSError('simulated disk write failure after registration')
                 return original_write(path, *args, **kwargs)
             with patch.object(manage, 'ROOT', root), patch.object(manage, 'CRON', cron), \
+                 patch.object(manage, 'STATE', base / 'state'), \
                  patch.object(manage, 'command', side_effect=fake_command), \
                  patch.object(manage, 'identity', return_value=(user, 100, [100])), \
                  patch.object(manage, 'check_access'), \
                  patch.object(manage, 'validate_state_path'), \
                  patch.object(manage, 'prompt_webhook', return_value=secret.strip()) as prompt_call, \
                  patch.object(manage.shutil, 'which', return_value='/usr/bin/flock'), \
-                 patch.object(manage, 'write', side_effect=maybe_fail), \
+                 patch.object(manage, 'write', side_effect=maybe_fail) as write_calls, \
                  patch.object(os, 'chown'), patch.object(os, 'fchown'):
                 for _ in range(1 if fail else 2):
                     transaction = manage.Transaction('agent')
@@ -301,7 +304,7 @@ class DeploymentTests(unittest.TestCase):
                     else:
                         manage.deploy(args, 'agent', transaction)
                         manage.shutil.rmtree(transaction.backup)
-                self.assertEqual((root / 'webhook').read_text(), secret)
+                self.assertEqual((root / 'webhook').read_text(), secret if prompt else secret.rstrip('\n'))
                 self.assertEqual((root / 'config.env').read_text(), config)
                 self.assertEqual(prompt_call.call_count, 1 if prompt else 0)
                 if fail:
@@ -312,13 +315,23 @@ class DeploymentTests(unittest.TestCase):
                     if migrate:
                         self.assertEqual(legacy.read_text(), legacy_original)
                 else:
-                    self.assertEqual(state['target']['scripts'], ['/opt/other', manage.HOOK])
-                    self.assertEqual(cron.read_text().count(' root '), 1)
-                    self.assertIn('0 3 * * 1 root', cron.read_text())
+                    for target in state['target'].values():
+                        self.assertTrue(target['enabled'])
+                        self.assertEqual(target['scripts'], ['/opt/other', manage.HOOK])
+                    if preserve_cron:
+                        self.assertEqual(cron.read_text(), 'old cron\n')
+                        self.assertNotIn(cron, [call.args[0] for call in write_calls.call_args_list])
+                        self.assertNotIn(root / 'webhook', [call.args[0] for call in write_calls.call_args_list])
+                    else:
+                        self.assertEqual(cron.read_text().count(' root '), 1)
+                        self.assertIn('0 3 * * 1 root', cron.read_text())
                     self.assertEqual((root / 'webhook').stat().st_mode & 0o777, 0o640)
                     self.assertEqual((root / 'alert.py').stat().st_mode & 0o777, 0o750)
                     if migrate:
                         self.assertEqual(legacy.read_text(), legacy_remaining)
+
+    def test_update_repairs_both_events_without_rewriting_cron_or_webhook(self):
+        self.exercise_deployment(preserve_cron=True)
 
     def test_repeat_update_preserves_secret_config_and_other_hooks(self):
         self.exercise_deployment()

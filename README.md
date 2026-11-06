@@ -4,7 +4,7 @@ Minimal Bash + Python integration for ImunifyAV malware alerts in Discord.
 Repository: [juzhax/imunify-discord](https://github.com/juzhax/imunify-discord).
 MIT licensed; Python standard library only.
 
-- Registers a script on `CUSTOM_SCAN_MALWARE_FOUND`, preserving other scripts and events.
+- Enables `CUSTOM_SCAN_MALWARE_FOUND` and `USER_SCAN_MALWARE_FOUND`, preserving other hooks and events.
 - Submits an on-demand scan of `/home` daily at **03:00 in the server's local timezone**.
 - Uses the system hostname as the Discord sender name; disables Discord mentions.
 - Never requests cleanup, quarantine, deletion, or changes to ImunifyAV's built-in schedule.
@@ -51,6 +51,7 @@ Use the same directory layout on each server:
 | `/opt/imunify-discord` | Root-owned Git checkout: source, installer, updates, tests and documentation |
 | `/etc/imunify-discord` | Webhook, configuration and installed runtime scripts managed by the installer |
 | `/etc/cron.d/imunify-discord` | Managed scan schedule |
+| `/var/lib/imunify-discord` | Private notification-user state for duplicate suppression |
 
 Keep an existing `/etc/imunify-discord` directory in place. Clone the source into
 `/opt/imunify-discord`; the installer reuses the existing webhook and preserves
@@ -94,6 +95,58 @@ Validate on one staging server first, then repeat these steps on each server.
 Each server uses its own system hostname and local configuration. Run the safe
 test and confirm the scan path, schedule and intensity on each deployment.
 
+## Verify and troubleshoot missing malware alerts
+
+A successful `--test` confirms webhook delivery, not notification registration.
+Older releases enabled only custom scans. User-account and background scans need
+`USER_SCAN_MALWARE_FOUND` as well; enabling only the custom event misses them.
+
+1. Repair the installation and verify both event registrations:
+
+   ```bash
+   cd /opt/imunify-discord
+   sudo git pull --ff-only
+   sudo bash update.sh
+   sudo bash update.sh --verify
+   ```
+
+   Expect `OK` for both `CUSTOM_SCAN_MALWARE_FOUND` and
+   `USER_SCAN_MALWARE_FOUND`. Verification makes no changes and returns nonzero
+   if either event is disabled, missing the hook, or lists it more than once.
+   The hook must be `/etc/imunify-discord/alert.py` for both events. To inspect
+   the agent directly, run `sudo imunify-antivirus notifications-config show --json`.
+
+2. Simulate both event types safely as the notifier user:
+
+   ```bash
+   sudo -u _imunify /usr/bin/python3 -I /etc/imunify-discord/alert.py --test-event both
+   ```
+
+   Expect two clearly labeled **SIMULATED TEST** messages. You can instead pass
+   `CUSTOM_SCAN_MALWARE_FOUND` or `USER_SCAN_MALWARE_FOUND` individually.
+   Simulation exercises the message formatting and Discord delivery, bypasses
+   duplicate suppression, and neither starts scans nor changes ImunifyAV history.
+   It does not prove that the notifier service emitted a real detection event.
+
+3. Check actual event delivery if tests pass but detections still go unreported:
+
+   ```bash
+   sudo journalctl -u imunify-notifier --since '24 hours ago' --no-pager
+   ```
+
+   Look for disabled hooks, permission errors, HTTP failures or duplicate-cache
+   warnings. The notifier must read the webhook, execute the hook and write its
+   private state directory. Use the verified notifier identity if it differs from
+   `_imunify`. Check SELinux denials and apply an appropriate policy without
+   disabling enforcement. Review DirectAdmin → ImunifyAV for the actual findings.
+
+4. Confirm what the test does and does not verify. Repairs apply to future events;
+   existing detections are not replayed automatically. An identical detection in
+   the same scan can be suppressed for five minutes after successful delivery.
+   Distinct findings and new scan identities can generate new alerts. Empty
+   fields mean the agent did not supply that detail; no malware sample is needed
+   for either safe test option.
+
 ## Configuration and updates
 
 Edit `/etc/imunify-discord/config.env` as root. `config.example.env` documents
@@ -115,7 +168,7 @@ to this project's on-demand scans. Managed scans explicitly use
 On DirectAdmin, Hestia and centminmod, confirm that `/home` covers your content;
 set `SCAN_PATH` if your deployment stores websites elsewhere.
 
-After editing configuration, or after fetching reviewed project updates:
+To upgrade and repair both malware notification registrations:
 
 ```bash
 cd /opt/imunify-discord
@@ -125,12 +178,14 @@ sudo bash update.sh
 
 The checkout is root-owned, so use `sudo` for Git updates as shown. Repeat the
 update and safe delivery test on each server after validating the change on
-staging. After editing only `config.env`, run `sudo bash update.sh` from this
-directory to apply the schedule; fetching source updates is optional.
+staging. Updates preserve the existing cron file. To deliberately apply a changed
+`SCAN_CRON`, run `sudo bash update.sh --refresh-cron` after editing `config.env`.
+The scan path and intensity are read from that file at each scheduled submission.
 
 Updates use the same transactional installer, require an existing webhook,
-retain `config.env` contents and reuse the secret. Changing the schedule requires
-an update to regenerate the single managed cron file. Installation/update does
+retain `config.env` and existing webhook contents, and repair both event hooks.
+An existing daily cron file is preserved unless `--refresh-cron` is requested; a
+missing managed cron file is created. Installation/update does
 not send a Discord message automatically. To rotate the webhook, use a root
 editor on `/etc/imunify-discord/webhook` and repeat the harmless test; never
 paste the secret into a shell command or store it in the checkout.
@@ -145,12 +200,14 @@ does not cancel active scans or modify the built-in background schedule.
 
 The installer keeps the existing paths `/etc/imunify-discord/alert.py` and
 `/etc/imunify-discord/webhook`. It replaces the old script, reuses the webhook,
-repairs access permissions, and deduplicates that script's notification entry.
+repairs access permissions, and registers the script once on both malware-found
+events. Running `update.sh` is sufficient; reinstallation is not required.
 
 Plain root-crontab entries running `imunify-antivirus malware on-demand start
 --path /home` (or `--path=/home`, with an optional `/dev/null` output redirect)
 are migrated to the single `/etc/cron.d/imunify-discord` job. Other root cron
-entries are preserved. The project's own cron file is replaced atomically.
+entries are preserved. Installation (or an explicit `--refresh-cron` update)
+writes the project's managed cron file atomically; ordinary updates retain it.
 
 More complex root-crontab commands or `/home` scans in another `/etc/cron.d`
 file cause installation to stop with the file/location identified. For a
@@ -190,6 +247,8 @@ review. Built-in ImunifyAV schedules are intentionally retained.
 | `webhook`, `config.env`, `agent` | root / notifier access group | `0640` |
 | `alert.py`, `scan.py` | root / notifier access group | `0750` |
 | `/etc/cron.d/imunify-discord` | root / root | `0644` |
+| `/var/lib/imunify-discord` | notifier user / primary group | `0700` |
+| `deliveries.sqlite3` and SQLite journal | notifier user | `0600` |
 
 The webhook never enters command arguments, project logs or notification
 registration JSON. The repository ignores live secret/config files and backups;
@@ -207,17 +266,41 @@ environment overrides and user site packages. Run installation/update only from
 a trusted, reviewed checkout; installer Python ignores Python environment overrides
 and user site packages while allowing its own local modules.
 
-Alerts deliberately send only the hostname and a generic malware-found message.
-File paths, event JSON and file contents are not forwarded to Discord. Inspect
-the malware list in ImunifyAV for details. Delivery is one attempt per event;
-HTTP errors, rate limits and network failures return nonzero without retries or
-a durable queue. Installation does not change existing ImunifyAV/AV+ remediation
-policies; review those separately if the server already performs automatic cleanup.
+Alerts include the server hostname, event type, affected users or scan path,
+and file paths/signatures/hashes supplied by ImunifyAV, followed by instructions
+to review DirectAdmin → ImunifyAV. Treat the Discord channel as security-sensitive:
+it receives account names and detection metadata. File contents, unrelated raw
+payload fields, and webhook URLs are not sent. Missing metadata produces a generic
+alert instead of a crash; unrelated explicit event types are ignored. Input is
+limited to 1 MiB; malformed or oversized input falls back to a generic alert.
+Details are bounded to Discord's message limit, with up to six file records shown.
+No extra scan or privileged malware-list query is used to enrich messages.
+
+A private SQLite cache suppresses repeat successful deliveries for five minutes.
+Fingerprints exclude the event type, so the same scan/detection reported through
+both registrations is sent once. Files, users, signatures, hashes and detection
+IDs distinguish findings; a new scan ID or timestamp distinguishes a new scan.
+When scan identity is absent, identical supplied file identities share the short
+five-minute window. Overlapping batches containing any new finding produce an
+alert with the scan summary. Cache entries contain only fingerprints and delivery
+timestamps, and are expired/pruned during delivery (at most 20,000 entries).
+
+Concurrent hook processes serialize delivery using a SQLite transaction. Only
+successful requests enter the cache. If identity or cache access is unavailable,
+the hook sends the alert rather than risk discarding a finding. Network ambiguity
+(for example, Discord accepts a request but the reply times out) can still cause a
+repeat on a later invocation; this is best-effort suppression, not exactly-once
+delivery. Simulated events and `--test` never read or modify the live cache.
+
+Delivery is one attempt per invocation; HTTP errors, rate limits and network
+failures return nonzero without retries or a durable queue. Installation does
+not change existing ImunifyAV/AV+ remediation policies; review those separately
+if the server already performs automatic cleanup.
 
 Install/update/uninstall operations are serialized with a separate `flock`.
 Before changes, a private rollback directory snapshots the existing configuration,
-managed cron and affected notification target. Failures and handled interrupts
-restore those files and the target. Rollback failure retains the protected backup
+managed cron and both affected notification targets. Failures and handled interrupts
+restore those files and targets. Rollback failure retains the protected backup
 and prints its path for administrator recovery. Successful operations delete the
 backup. Concurrent external changes to the same notification target should be
 avoided. Power loss or `SIGKILL` cannot trigger Python rollback.
@@ -251,17 +334,20 @@ Implementation was checked against the official
 
 ```text
 imunify-antivirus notifications-config show --json
-imunify-antivirus notifications-config update '{"rules":{"CUSTOM_SCAN_MALWARE_FOUND":{"SCRIPT":{"enabled":true,"scripts":["/etc/imunify-discord/alert.py"]}}}}'
+imunify-antivirus notifications-config update '{"rules":{"CUSTOM_SCAN_MALWARE_FOUND":{"SCRIPT":{"enabled":true,"scripts":["/etc/imunify-discord/alert.py"]}},"USER_SCAN_MALWARE_FOUND":{"SCRIPT":{"enabled":true,"scripts":["/etc/imunify-discord/alert.py"]}}}}'
 imunify-antivirus malware on-demand start --path /home --no-follow-symlinks --intensity-cpu 2 --intensity-io 2
 ```
 
 The JSON above illustrates the API; the installer reads the current target and
-merges its script list so other integrations survive. Removal uses the same
+merges both script lists so other integrations survive. Removal uses the same
 `notifications-config update` API with only this script removed, disabling an
 empty target. There is no invented `notifications-config add/remove` command.
 The ImunifyAV event reference describes `CUSTOM_SCAN_MALWARE_FOUND` as an
 on-demand scan completion event with malware found. Built-in background scans
-use the `USER_SCAN_*` family and are outside this project's registration.
+use `USER_SCAN_MALWARE_FOUND`, which this project also enables. ImunifyAV sends
+JSON through stdin using `event_id`, `scan_id`, `path`, `malicious_files` and
+optional scan totals/timestamps; see the official
+[reference hook](https://github.com/cloudlinux/imunify360-documentation/blob/master/docs/.vuepress/public/hook_script.py).
 
 ## Uninstall
 
@@ -270,9 +356,10 @@ cd /opt/imunify-discord
 sudo bash uninstall.sh
 ```
 
-Removes only this project's notification script entry, managed cron job and
+Removes only this project's script entries from both events, managed cron job and
 installed Python scripts/agent path. Other hooks survive. Leaves the webhook,
-`config.env`, existing unrelated files, ImunifyAV, and its schedules in place.
+`config.env`, private duplicate cache, existing unrelated files, ImunifyAV, and
+its schedules in place.
 An active scan is not stopped. Once you no longer need rollback/reinstallation,
 you may remove the retained configuration directory yourself.
 
@@ -290,3 +377,7 @@ cron migration and rollback. Validate on a staging ImunifyAV server before
 rolling out to multiple production servers.
 Prompt tests also use a real pseudo-terminal and cover hidden-input failures,
 first-install prompting, secret reuse and redacted failure diagnostics.
+Event tests cover both registrations and payload types, missing fields, safe
+simulations, concurrent duplicate suppression, distinct findings, failed-delivery
+retry eligibility, partial-registration rollback, and preservation of existing
+webhook contents and cron files during update.

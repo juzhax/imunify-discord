@@ -18,13 +18,14 @@ import tempfile
 import warnings
 from pathlib import Path
 
-from alert import validate_webhook
+from alert import EVENTS, validate_webhook
 from scan import read_config, validate_cron
 
 ROOT = Path('/etc/imunify-discord')
 CRON = Path('/etc/cron.d/imunify-discord')
 HOOK = str(ROOT / 'alert.py')  # Keep the established notification path for compatible upgrades.
-EVENT = 'CUSTOM_SCAN_MALWARE_FOUND'
+EVENT = EVENTS[0]
+STATE = Path('/var/lib/imunify-discord')
 SOURCE = Path(__file__).resolve().parent.parent
 
 
@@ -43,22 +44,25 @@ def show(agent):
     try:
         data = json.loads(command([agent, 'notifications-config', 'show', '--json']).stdout)
         rules = data.get('items', data)['rules']
-        target = rules.get(EVENT, {}).get('SCRIPT', {'enabled': False, 'scripts': []})
-        if not isinstance(target.get('enabled'), bool) or not isinstance(target.get('scripts'), list):
-            raise ValueError()
-        if any(not isinstance(x, str) or not x.startswith('/') for x in target['scripts']):
-            raise ValueError()
-        return copy.deepcopy(target)
+        targets = {}
+        for event in EVENTS:
+            target = rules.get(event, {}).get('SCRIPT', {'enabled': False, 'scripts': []})
+            if not isinstance(target.get('enabled'), bool) or not isinstance(target.get('scripts'), list):
+                raise ValueError()
+            if any(not isinstance(x, str) or not x.startswith('/') for x in target['scripts']):
+                raise ValueError()
+            targets[event] = copy.deepcopy(target)
+        return targets
     except (AttributeError, KeyError, TypeError, ValueError):
         raise RuntimeError('Unsupported notifications-config JSON schema; no changes made.') from None
 
 
-def update(agent, target):
-    data = json.dumps({'rules': {EVENT: {'SCRIPT': target}}})
+def update(agent, targets):
+    data = json.dumps({'rules': {event: {'SCRIPT': targets[event]} for event in EVENTS}})
     # Payload contains executable paths and booleans only, never the webhook.
     command([agent, 'notifications-config', 'update', data])
     actual = show(agent)
-    if any(actual.get(k) != v for k, v in target.items()):
+    if any(actual[event].get(k) != v for event in EVENTS for k, v in targets[event].items()):
         raise RuntimeError('Notification update did not persist as requested.')
 
 
@@ -75,6 +79,30 @@ def registration(old, remove=False):
     if remove and scripts:
         new['enabled'] = old['enabled']
     return new
+
+
+def verify(agent):
+    targets = show(agent)
+    valid = True
+    for event in EVENTS:
+        target = targets[event]
+        ok = target['enabled'] and target['scripts'].count(HOOK) == 1
+        print(event + ': ' + ('OK (enabled; hook registered once)' if ok else 'FAIL (disabled, missing or duplicate hook)'))
+        valid = valid and ok
+    return 0 if valid else 1
+
+
+def prepare_state(user):
+    if STATE.is_symlink():
+        raise RuntimeError('Refusing symbolic link for duplicate suppression state.')
+    if STATE.exists():
+        info = STATE.stat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, user.pw_uid):
+            raise RuntimeError('Untrusted duplicate suppression state directory ownership or type.')
+    else:
+        STATE.mkdir(mode=0o700)
+    os.chown(STATE, user.pw_uid, user.pw_gid)
+    os.chmod(STATE, 0o700)
 
 
 def write(path, data, mode, gid=0):
@@ -118,10 +146,11 @@ def check_access(user, groups):
     result = subprocess.run(['/usr/bin/python3', '-I', '-c',
                              'import os; from pathlib import Path; '
                              'Path("/etc/imunify-discord/webhook").read_bytes(); '
-                             'assert os.access("/etc/imunify-discord/alert.py", os.X_OK)'],
+                             'assert os.access("/etc/imunify-discord/alert.py", os.X_OK); '
+                             'assert os.access("/var/lib/imunify-discord", os.W_OK | os.X_OK)'],
                             preexec_fn=drop, capture_output=True, timeout=10)
     if result.returncode:
-        raise RuntimeError('Notification user cannot read webhook or execute alert.py.')
+        raise RuntimeError('Notification user cannot read webhook, execute alert.py or write duplicate state.')
 
 
 def legacy_crontab(text):
@@ -218,6 +247,7 @@ class Transaction:
         self.notify_changed = False
         self.legacy_changed = False
         self.legacy_path = None
+        self.state_prepared = False
         self.had_root = ROOT.exists()
         self.root_stat = ROOT.stat() if self.had_root else None
         self.owners = {}
@@ -267,6 +297,15 @@ class Transaction:
                       stat.S_IMODE(self.legacy_stat.st_mode), self.legacy_stat.st_gid)
             except Exception:
                 errors.append('selected legacy cron file')
+        if self.state_prepared:
+            try:
+                if self.state_before is None:
+                    STATE.rmdir()
+                else:
+                    os.chown(STATE, self.state_before.st_uid, self.state_before.st_gid)
+                    os.chmod(STATE, stat.S_IMODE(self.state_before.st_mode))
+            except Exception:
+                errors.append('duplicate suppression state directory')
         if errors:
             print('Error: rollback incomplete for ' + ', '.join(errors) +
                   '. Protected backup retained at ' + str(self.backup), file=sys.stderr)
@@ -393,7 +432,11 @@ def deploy(args, agent, transaction):
     ROOT.mkdir(mode=0o750, exist_ok=True)
     os.chown(ROOT, 0, gid)
     os.chmod(ROOT, 0o750)
-    write(ROOT / 'webhook', secret + '\n', 0o640, gid)
+    if not existing.exists():
+        write(existing, secret + '\n', 0o640, gid)
+    else:
+        os.chown(existing, 0, gid)
+        os.chmod(existing, 0o640)
     if not (ROOT / 'config.env').exists():
         write(ROOT / 'config.env', (SOURCE / 'config.example.env').read_bytes(), 0o640, gid)
     else:
@@ -402,11 +445,15 @@ def deploy(args, agent, transaction):
     for script in ('alert.py', 'scan.py'):
         write(ROOT / script, (SOURCE / 'scripts' / script).read_bytes(), 0o750, gid)
     write(ROOT / 'agent', agent + '\n', 0o640, gid)
+    transaction.stage = 'duplicate suppression state preparation'
+    transaction.state_before = STATE.lstat() if STATE.exists() else None
+    prepare_state(user)
+    transaction.state_prepared = True
     transaction.stage = 'notification user access check'
     check_access(user, groups)
     transaction.stage = 'notification registration'
     transaction.notify_changed = True
-    update(agent, registration(transaction.old_target))
+    update(agent, {event: registration(target) for event, target in transaction.old_target.items()})
     if migrated != root_tab.stdout:
         transaction.stage = 'legacy cron migration'
         write(transaction.backup / 'root-crontab', root_tab.stdout, 0o600)
@@ -425,7 +472,8 @@ def deploy(args, agent, transaction):
             ' root /usr/bin/flock -n /run/imunify-discord-scan.lock /usr/bin/python3 -I /etc/imunify-discord/scan.py\n')
     if shutil.which('flock') != '/usr/bin/flock' and not Path('/usr/bin/flock').exists():
         raise RuntimeError('Require flock at /usr/bin/flock.')
-    write(CRON, cron, 0o644)
+    if not args.update or not CRON.exists() or getattr(args, 'refresh_cron', False):
+        write(CRON, cron, 0o644)
 
 
 def main():
@@ -435,6 +483,8 @@ def main():
     parser.add_argument('--update', action='store_true')
     parser.add_argument('--notification-user', help='override verified notifier identity (default: _imunify)')
     parser.add_argument('--migrate-cron', metavar='FILE', help='migrate an equivalent scan from a selected /etc/cron.d file')
+    parser.add_argument('--verify', action='store_true', help='check both malware event registrations without changing anything')
+    parser.add_argument('--refresh-cron', action='store_true', help='explicitly regenerate cron from config.env during an update')
     args = parser.parse_args()
     if args.migrate_cron and args.action != 'install':
         parser.error('--migrate-cron is available only for install/update')
@@ -445,7 +495,9 @@ def main():
     transaction = None
     stage = 'dependency and deployment path validation'
     try:
-        agent = preflight(install=args.action == 'install')
+        agent = preflight(install=args.action == 'install' and not args.verify)
+        if args.verify:
+            return verify(agent)
         stage = 'installer lock acquisition'
         # Serialize installs/updates/uninstalls. Root-owned /run prevents lock replacement.
         fd = os.open('/run/imunify-discord-install.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -459,7 +511,7 @@ def main():
                 else:
                     transaction.stage = 'notification and runtime removal'
                     transaction.notify_changed = True
-                    update(agent, registration(transaction.old_target, remove=True))
+                    update(agent, {event: registration(target, remove=True) for event, target in transaction.old_target.items()})
                     if CRON.exists():
                         CRON.unlink()
                     # Preserve webhook, administrator configuration and legacy files.
@@ -471,7 +523,7 @@ def main():
                 transaction.rollback()
                 raise
             shutil.rmtree(transaction.backup)
-        print('Installed: notification hook and managed cron job. Configuration preserved.' if args.action == 'install'
+        print('Installed/updated: both malware event hooks enabled. Configuration preserved.' if args.action == 'install'
               else 'Uninstalled: hook and cron removed. Configuration and webhook retained in /etc/imunify-discord.')
         return 0
     except (Exception, KeyboardInterrupt) as exc:

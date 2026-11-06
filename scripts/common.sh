@@ -39,6 +39,21 @@ validate_cron() {
     done
 }
 
+# SCAN_PATH holds one or more space-separated directories, e.g. "/home /var/lib/docker/volumes".
+# Results go to the SCAN_PATHS array. Wildcards are rejected because ImunifyAV expands them itself.
+parse_scan_paths() {
+    local path
+    local -A unique=()
+    SCAN_PATHS=()
+    read -r -a SCAN_PATHS <<< "$1"
+    ((${#SCAN_PATHS[@]} >= 1 && ${#SCAN_PATHS[@]} <= 16)) || { error 'SCAN_PATH needs 1 to 16 space-separated directories.'; return 1; }
+    for path in "${SCAN_PATHS[@]}"; do
+        [[ $path == /* && $path != *[*?[]* && -d $path ]] || { error "SCAN_PATH entry must be an existing absolute directory without wildcards: $path"; return 1; }
+        [[ ! ${unique[$path]+yes} ]] || { error "Duplicate SCAN_PATH entry: $path"; return 1; }
+        unique[$path]=1
+    done
+}
+
 read_config() {
     local file=$1 line key value
     local -A seen=()
@@ -58,7 +73,7 @@ read_config() {
     done < "$file"
     ((${#seen[@]} == 4)) || { error 'Define all four scan configuration keys.'; return 1; }
     [[ $SCAN_CPU =~ ^[1-7]$ && $SCAN_IO =~ ^[1-7]$ ]] || { error 'Scan intensity must be 1 through 7.'; return 1; }
-    [[ $SCAN_PATH == /* && -d $SCAN_PATH ]] || { error 'SCAN_PATH must be an existing absolute directory.'; return 1; }
+    parse_scan_paths "$SCAN_PATH" || return 1
     validate_cron "$SCAN_CRON" || { error 'Invalid SCAN_CRON schedule.'; return 1; }
 }
 

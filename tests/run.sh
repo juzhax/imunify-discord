@@ -41,6 +41,31 @@ done
 pass 'invalid cron values rejected'
 printf 'SCAN_CRON=0 3 * * *\nSCAN_PATH=%s\nSCAN_CPU=2\nSCAN_IO=2\n' "$TEST_DIR" > "$TEST_DIR/config.env"
 read_config "$TEST_DIR/config.env"; pass 'configuration parsed as data'
+mkdir -p "$TEST_DIR/volumes" "$TEST_DIR/home"
+parse_scan_paths "$TEST_DIR/home  $TEST_DIR/volumes"
+[[ ${#SCAN_PATHS[@]} == 2 && ${SCAN_PATHS[1]} == "$TEST_DIR/volumes" ]]; pass 'multiple scan paths parsed'
+for bad in "$TEST_DIR/home $TEST_DIR/home" "$TEST_DIR/vol*" 'relative/path' "$TEST_DIR/missing" ''; do
+    if parse_scan_paths "$bad" 2>/dev/null; then printf 'FAIL: bad scan path accepted: %s\n' "$bad"; exit 1; fi
+done
+pass 'duplicate, wildcard, relative, missing and empty scan paths rejected'
+
+mkdir "$TEST_DIR/scan"
+printf '%s\n' "$TEST_DIR/fake-agent" > "$TEST_DIR/scan/agent"
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s"\n' "$TEST_DIR/agent-calls" > "$TEST_DIR/fake-agent"
+chmod +x "$TEST_DIR/fake-agent"
+run_scan() {
+    printf 'SCAN_CRON=0 3 * * *\nSCAN_PATH=%s\nSCAN_CPU=2\nSCAN_IO=3\n' "$1" > "$TEST_DIR/scan/config.env"
+    rm -f "$TEST_DIR/agent-calls"
+    "$BASH" -c 'source "$1/scripts/scan.sh"; CONFIG=$2; scan_main' test "$ROOT" "$TEST_DIR/scan"
+}
+run_scan "$TEST_DIR/home"
+[[ $(< "$TEST_DIR/agent-calls") == "malware on-demand start --path $TEST_DIR/home --no-follow-symlinks --intensity-cpu 2 --intensity-io 3" ]]
+pass 'single path uses on-demand start'
+run_scan "$TEST_DIR/home $TEST_DIR/volumes"
+[[ $(< "$TEST_DIR/agent-calls") == "malware on-demand queue put $TEST_DIR/home $TEST_DIR/volumes --no-follow-symlinks --intensity-cpu 2 --intensity-io 3" ]]
+pass 'multiple paths use one on-demand queue submission'
+! grep -Eq 'cleanup|quarantine|restore|remove' "$TEST_DIR/agent-calls"; pass 'scan never requests remediation'
+
 printf 'EVIL=$(touch /tmp/never-run)\n' >> "$TEST_DIR/config.env"
 if read_config "$TEST_DIR/config.env" 2>/dev/null; then exit 1; fi
 pass 'unknown configuration cannot execute shell code'

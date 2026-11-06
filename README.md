@@ -6,7 +6,8 @@ No Python interpreter or Python packages are required.
 
 - Enables both `CUSTOM_SCAN_MALWARE_FOUND` and `USER_SCAN_MALWARE_FOUND`.
 - Includes hostname, affected users/scan path, supplied malware details and event type.
-- Adds a daily 03:00 `/home` on-demand scan with configurable schedule and intensity.
+- Adds a daily 03:00 `/home` on-demand scan with configurable schedule, intensity and
+  extra paths such as [Docker volumes](#docker-volumes).
 - Preserves other notification hooks, configuration and ImunifyAV's built-in schedule.
 - Never requests cleanup, quarantine or deletion of infected files.
 
@@ -210,8 +211,43 @@ SCAN_IO=2
 
 The file is parsed as data, never sourced or evaluated. Define all four keys
 without quotes, exports or inline comments. CPU and I/O intensity range from
-1 (lowest) to 7 (highest). The scan directory must exist. Scans explicitly use
-`--no-follow-symlinks`; confirm `/home` covers your website storage.
+1 (lowest) to 7 (highest). Scans explicitly use `--no-follow-symlinks`; confirm
+the configured paths cover your website storage.
+
+`SCAN_PATH` accepts 1–16 space-separated absolute directories. Each must exist;
+duplicates, wildcards and paths containing spaces are rejected. A single path is
+submitted with `malware on-demand start`. Several paths are submitted together with
+`malware on-demand queue put`, so ImunifyAV runs them one after another. Older
+agents without queue support are refused at install/update time.
+
+### Docker volumes
+
+ImunifyAV scans host directories, not containers. Scan the host location of the
+container's files:
+
+| Compose mount | Host path to add to `SCAN_PATH` |
+| --- | --- |
+| Bind mount, e.g. `./storage:/var/www/storage` | That host directory |
+| Named volume, e.g. `storage:/var/www/storage` | `docker volume inspect -f '{{ .Mountpoint }}' NAME` (normally `/var/lib/docker/volumes/NAME/_data`) |
+| All named volumes | `/var/lib/docker/volumes` (check `docker info -f '{{ .DockerRootDir }}'`) |
+| Rootless Docker | `~/.local/share/docker/volumes` of the user running it |
+
+```ini
+SCAN_PATH=/home /var/lib/docker/volumes
+```
+
+Code built into an image (`COPY` in a Dockerfile) is not in a volume. Avoid
+scanning `/var/lib/docker/overlay2`: it is large, duplicates image layers and
+container paths change on recreation. Scan application code in CI or keep it in a
+bind mount. Findings in volumes usually show a numeric owner (container UID such
+as `33` or `82`) rather than a panel account.
+
+Scans are detection-only: this project never requests cleanup, quarantine or
+deletion. ImunifyAV still applies its own settings. In particular, the agent's
+default `MALWARE_SCANNING.sends_file_for_analysis: True` uploads malicious and
+suspicious files to the Imunify team; set it to `False` if volume data must not
+leave the server. ImunifyAV+ features such as Malware Cleanup are controlled in
+ImunifyAV, not here.
 
 The schedule uses the server's local timezone. Five numeric cron fields support
 lists, ranges and steps: `0 3 * * 0` is weekly; `0 */6 * * *` is every six hours.
@@ -241,8 +277,9 @@ Supported form: a root job with `malware on-demand start --path PATH
 --no-follow-symlinks --intensity-cpu N --intensity-io N`, in that order, optionally
 wrapped in `/usr/bin/flock -n /run/NAME.lock` (or `/var/run`) and followed by
 `>> /var/log/NAME.log 2>&1` or `/dev/null` redirection. Schedule, path and intensities
-must match the effective configuration. Unsupported/differing commands and
-multiple scan entries stop migration without removing the old job.
+must match the effective configuration, so migrate with a single `SCAN_PATH` and
+add extra paths afterwards. Unsupported/differing commands and multiple scan
+entries stop migration without removing the old job.
 
 Only the matching entry is removed. Comments, unrelated entries and old log files
 remain; the new job uses normal cron output handling. Migration is repeatable and

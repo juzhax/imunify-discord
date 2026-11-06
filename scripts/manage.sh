@@ -123,6 +123,10 @@ manager_main() {
     stage_config=$CONFIG/config.env
     [[ -f $stage_config ]] || stage_config=$MANAGER_BASE/config.example.env
     read_config "$stage_config"
+    if ((${#SCAN_PATHS[@]} > 1)); then
+        help_file=$("$AGENT" malware on-demand queue put --help 2>/dev/null) || { error 'Multiple SCAN_PATH entries need ImunifyAV on-demand queue support.'; return 1; }
+        for dependency in --no-follow-symlinks --intensity-cpu --intensity-io; do [[ $help_file == *"$dependency"* ]] || { error 'Agent queue lacks required scan options.'; return 1; }; done
+    fi
     STAGE='existing cron validation'
     if ! crontab -l > "$BACKUP/root-crontab" 2> "$BACKUP/crontab-error"; then
         grep -q 'no crontab for' "$BACKUP/crontab-error" || { error 'Cannot read root crontab.'; return 1; }

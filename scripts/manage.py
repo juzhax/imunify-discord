@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 
 from alert import validate_webhook
@@ -47,7 +48,7 @@ def show(agent):
         if any(not isinstance(x, str) or not x.startswith('/') for x in target['scripts']):
             raise ValueError()
         return copy.deepcopy(target)
-    except (KeyError, TypeError, ValueError):
+    except (AttributeError, KeyError, TypeError, ValueError):
         raise RuntimeError('Unsupported notifications-config JSON schema; no changes made.') from None
 
 
@@ -254,10 +255,40 @@ def preflight(install=True):
     return agent
 
 
+def prompt_webhook(tty_path='/dev/tty'):
+    # Text r+ uses BufferedRandom, which requires a seekable file. Terminals
+    # are not seekable. getpass reads independently; this stream is output only.
+    try:
+        with open(tty_path, 'w') as tty, warnings.catch_warnings():
+            warnings.simplefilter('error', getpass.GetPassWarning)
+            value = getpass.getpass('Discord webhook (hidden): ', stream=tty)
+    except (OSError, getpass.GetPassWarning):
+        raise RuntimeError('Cannot securely prompt for webhook. Run from an interactive terminal; input must remain hidden.') from None
+    try:
+        return validate_webhook(value.strip())
+    except ValueError:
+        raise RuntimeError('Invalid webhook format. Use an HTTPS Discord webhook URL without query parameters.') from None
+
+
+def failure_message(exc, stage):
+    if isinstance(exc, RuntimeError):
+        return str(exc)
+    if isinstance(exc, KeyboardInterrupt):
+        return 'Interrupted during ' + stage + '; rollback attempted if changes were started.'
+    # Exception text and tracebacks may contain the webhook. Report only the
+    # fixed stage, exception class and numeric errno, never exception values.
+    detail = type(exc).__name__
+    if isinstance(exc, OSError) and exc.errno is not None:
+        detail += ', errno=' + str(exc.errno)
+    return 'Operation failed during ' + stage + ' (' + detail + '). Check dependencies, permissions and configuration.'
+
+
 def deploy(args, agent, transaction):
+    transaction.stage = 'notification user validation'
     user, gid, groups = identity(args.notification_user)
     if args.update and (not ROOT.is_dir() or not (ROOT / 'webhook').exists()):
         raise RuntimeError('No existing webhook to preserve. Run install.sh first.')
+    transaction.stage = 'configuration validation'
     if (ROOT / 'config.env').exists():
         try:
             config = read_config(ROOT / 'config.env')
@@ -266,18 +297,16 @@ def deploy(args, agent, transaction):
     else:
         config = read_config(SOURCE / 'config.example.env')
     existing = ROOT / 'webhook'
+    transaction.stage = 'webhook loading'
     if existing.exists():
         try:
             secret = validate_webhook(existing.read_text().strip())
         except ValueError:
             raise RuntimeError('Existing webhook format is invalid; edit /etc/imunify-discord/webhook.') from None
     else:
-        # getpass raises rather than falling back to visible stdin.
-        with open('/dev/tty', 'r+') as tty:
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter('error', getpass.GetPassWarning)
-                secret = validate_webhook(getpass.getpass('Discord webhook (hidden): ', stream=tty).strip())
+        transaction.stage = 'secure webhook prompt'
+        secret = prompt_webhook()
+    transaction.stage = 'existing cron validation'
     root_tab = command(['crontab', '-l'], ok=(0, 1))
     if root_tab.returncode == 1 and ('no crontab for' not in root_tab.stderr or root_tab.stdout):
         raise RuntimeError('Unable to read root crontab.')
@@ -289,6 +318,7 @@ def deploy(args, agent, transaction):
         for line in path.read_text(errors='replace').splitlines():
             if not line.lstrip().startswith('#') and 'imunify-antivirus' in line and 'on-demand' in line and '/home' in line:
                 raise RuntimeError('Unmanaged /home scan found in ' + str(path) + '; migrate it before installing.')
+    transaction.stage = 'runtime file installation'
     ROOT.mkdir(mode=0o750, exist_ok=True)
     os.chown(ROOT, 0, gid)
     os.chmod(ROOT, 0o750)
@@ -301,14 +331,18 @@ def deploy(args, agent, transaction):
     for script in ('alert.py', 'scan.py'):
         write(ROOT / script, (SOURCE / 'scripts' / script).read_bytes(), 0o750, gid)
     write(ROOT / 'agent', agent + '\n', 0o640, gid)
+    transaction.stage = 'notification user access check'
     check_access(user, groups)
+    transaction.stage = 'notification registration'
     transaction.notify_changed = True
     update(agent, registration(transaction.old_target))
     if migrated != root_tab.stdout:
+        transaction.stage = 'legacy cron migration'
         write(transaction.backup / 'root-crontab', root_tab.stdout, 0o600)
         write(transaction.backup / 'new-crontab', migrated, 0o600)
         transaction.cron_changed = True
         command(['crontab', str(transaction.backup / 'new-crontab')])
+    transaction.stage = 'scan schedule installation'
     cron = ('# Managed by imunify-discord; edit config.env and rerun update.sh.\n'
             'SHELL=/bin/sh\nPATH=/usr/sbin:/usr/bin:/sbin:/bin\n' + config['SCAN_CRON'] +
             ' root /usr/bin/flock -n /run/imunify-discord-scan.lock /usr/bin/python3 -I /etc/imunify-discord/scan.py\n')
@@ -328,17 +362,22 @@ def main():
         raise RuntimeError('Interrupted; installation rollback attempted.')
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGHUP, interrupted)
+    transaction = None
+    stage = 'dependency and deployment path validation'
     try:
         agent = preflight(install=args.action == 'install')
+        stage = 'installer lock acquisition'
         # Serialize installs/updates/uninstalls. Root-owned /run prevents lock replacement.
         fd = os.open('/run/imunify-discord-install.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, 'w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            stage = 'notification and file backup'
             transaction = Transaction(agent)
             try:
                 if args.action == 'install':
                     deploy(args, agent, transaction)
                 else:
+                    transaction.stage = 'notification and runtime removal'
                     transaction.notify_changed = True
                     update(agent, registration(transaction.old_target, remove=True))
                     if CRON.exists():
@@ -357,7 +396,7 @@ def main():
         return 0
     except (Exception, KeyboardInterrupt) as exc:
         # Never print arbitrary exception text: it could contain the webhook.
-        message = str(exc) if isinstance(exc, RuntimeError) else 'Operation failed; check dependencies, permissions and configuration format.'
+        message = failure_message(exc, getattr(transaction, 'stage', stage))
         print('Error: ' + message, file=sys.stderr)
         return 1
 

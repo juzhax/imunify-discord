@@ -18,6 +18,50 @@ import scan
 
 
 class ProjectTests(unittest.TestCase):
+    def test_secure_prompt_opens_real_nonseekable_terminal(self):
+        # Isolate terminal/session side effects from the test runner itself.
+        code = '''
+import os
+import signal
+from unittest.mock import patch
+import manage
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+master, slave = os.openpty()
+try:
+    with patch.object(manage.getpass, 'getpass', return_value='https://discord.com/api/webhooks/123/synthetic_test_value') as prompt:
+        value = manage.prompt_webhook(os.ttyname(slave))
+        assert value.endswith('/synthetic_test_value')
+        assert prompt.call_args.kwargs['stream'].mode == 'w'
+finally:
+    os.close(master)
+    os.close(slave)
+'''
+        result = subprocess.run([sys.executable, '-c', code], cwd=Path(manage.__file__).parent,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '')
+
+    def test_prompt_requires_hidden_input_and_valid_url(self):
+        with patch('manage.open', create=True, side_effect=OSError('private-value')):
+            with self.assertRaisesRegex(RuntimeError, 'interactive terminal'):
+                manage.prompt_webhook()
+        with patch('manage.open', create=True, return_value=io.StringIO()), \
+             patch.object(manage.getpass, 'getpass', side_effect=manage.getpass.GetPassWarning('private-value')):
+            with self.assertRaisesRegex(RuntimeError, 'input must remain hidden'):
+                manage.prompt_webhook()
+        with patch('manage.open', create=True, return_value=io.StringIO()), \
+             patch.object(manage.getpass, 'getpass', return_value='invalid-private-value'):
+            with self.assertRaisesRegex(RuntimeError, 'Invalid webhook format'):
+                manage.prompt_webhook()
+
+    def test_safe_diagnostics_include_stage_without_exception_values(self):
+        for error in (OSError(13, 'private-value'), ValueError('private-value')):
+            message = manage.failure_message(error, 'secure webhook prompt')
+            self.assertIn('secure webhook prompt', message)
+            self.assertIn(type(error).__name__, message)
+            self.assertNotIn('private-value', message)
+        self.assertIn('errno=13', manage.failure_message(OSError(13, 'private-value'), 'backup'))
+
     def test_state_paths_reject_unsafe_permissions_ownership_and_types(self):
         for mode, uid in ((stat.S_IFREG | 0o660, 0), (stat.S_IFREG | 0o644, 1000),
                           (stat.S_IFIFO | 0o600, 0), (stat.S_IFLNK | 0o777, 0)):
@@ -167,7 +211,7 @@ class ProjectTests(unittest.TestCase):
 
 
 class DeploymentTests(unittest.TestCase):
-    def exercise_deployment(self, fail=False):
+    def exercise_deployment(self, fail=False, prompt=False):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             root = base / 'config'
@@ -175,6 +219,8 @@ class DeploymentTests(unittest.TestCase):
             # Intentionally synthetic credentials, never contact Discord.
             secret = 'https://discord.com/api/webhooks/123/synthetic_test_value\n'
             (root / 'webhook').write_text(secret)
+            if prompt:
+                (root / 'webhook').unlink()
             (root / 'alert.py').write_text('old script')
             config = 'SCAN_CRON=0 3 * * 1\nSCAN_PATH=' + tmp + '\nSCAN_CPU=1\nSCAN_IO=3\n'
             (root / 'config.env').write_text(config)
@@ -195,7 +241,7 @@ class DeploymentTests(unittest.TestCase):
                     return subprocess.CompletedProcess(args, 0, '0 1 * * * /usr/bin/backup\n', '')
                 raise AssertionError(args)
             user = type('User', (), {'pw_name': '_imunify', 'pw_uid': 100, 'pw_gid': 100})()
-            args = type('Args', (), {'notification_user': None, 'update': True})()
+            args = type('Args', (), {'notification_user': None, 'update': not prompt})()
             original_write = manage.write
             failed = False
             def maybe_fail(path, *args, **kwargs):
@@ -208,6 +254,7 @@ class DeploymentTests(unittest.TestCase):
                  patch.object(manage, 'command', side_effect=fake_command), \
                  patch.object(manage, 'identity', return_value=(user, 100, [100])), \
                  patch.object(manage, 'check_access'), \
+                 patch.object(manage, 'prompt_webhook', return_value=secret.strip()) as prompt_call, \
                  patch.object(manage.shutil, 'which', return_value='/usr/bin/flock'), \
                  patch.object(manage, 'write', side_effect=maybe_fail), \
                  patch.object(os, 'chown'), patch.object(os, 'fchown'):
@@ -222,6 +269,7 @@ class DeploymentTests(unittest.TestCase):
                         manage.shutil.rmtree(transaction.backup)
                 self.assertEqual((root / 'webhook').read_text(), secret)
                 self.assertEqual((root / 'config.env').read_text(), config)
+                self.assertEqual(prompt_call.call_count, 1 if prompt else 0)
                 if fail:
                     self.assertEqual(state['target'], original_target)
                     self.assertEqual((root / 'alert.py').read_text(), 'old script')
@@ -239,6 +287,9 @@ class DeploymentTests(unittest.TestCase):
 
     def test_install_failure_after_registration_rolls_back(self):
         self.exercise_deployment(fail=True)
+
+    def test_install_without_webhook_prompts_once_then_reuses_secret(self):
+        self.exercise_deployment(prompt=True)
 
 
 if __name__ == '__main__':

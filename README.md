@@ -203,6 +203,21 @@ real events fail, check ImunifyAV notifier logs and any SELinux/AppArmor denials
 use an appropriate local policy rather than disabling enforcement. Cron errors
 use the server's normal cron output/mail handling; raw agent output is suppressed.
 
+If a first installation fails before the webhook prompt with the generic error
+from an older version, fetch the fix and retry installation from the same checkout:
+
+```bash
+cd /opt/imunify-discord
+sudo git pull --ff-only
+sudo bash install.sh
+```
+
+The installer opens the terminal for prompt output only; a terminal cannot be
+opened as a seekable read/write file. New error messages identify the failing
+stage and exception type without printing exception values or webhook secrets.
+Use `install.sh` when retrying a failed first installation; `update.sh` requires
+an existing webhook. An existing valid webhook is reused without prompting.
+
 ## CLI verification
 
 Implementation was checked against the official
@@ -248,3 +263,5 @@ validation, secret redaction, hostname/mention behavior, cron/config validation,
 detection-only scan arguments, CLI readback, registration idempotency, legacy
 cron migration and rollback. Validate on a staging ImunifyAV server before
 rolling out to multiple production servers.
+Prompt tests also use a real pseudo-terminal and cover hidden-input failures,
+first-install prompting, secret reuse and redacted failure diagnostics.

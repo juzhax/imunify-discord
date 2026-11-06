@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -I
 """ImunifyAV notification hook. No third-party packages or secret arguments."""
 import argparse
 import json

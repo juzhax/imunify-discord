@@ -21,7 +21,7 @@ from scan import read_config
 
 ROOT = Path('/etc/imunify-discord')
 CRON = Path('/etc/cron.d/imunify-discord')
-HOOK = str(ROOT / 'alert.py')  # Preserve the established notification path.
+HOOK = str(ROOT / 'alert.py')  # Keep the established notification path for compatible upgrades.
 EVENT = 'CUSTOM_SCAN_MALWARE_FOUND'
 SOURCE = Path(__file__).resolve().parent.parent
 
@@ -113,7 +113,7 @@ def check_access(user, groups):
         os.setgid(user.pw_gid)
         os.setuid(user.pw_uid)
     # A real access check as the notifier identity, including parent traversal.
-    result = subprocess.run(['/usr/bin/python3', '-c',
+    result = subprocess.run(['/usr/bin/python3', '-I', '-c',
                              'import os; from pathlib import Path; '
                              'Path("/etc/imunify-discord/webhook").read_bytes(); '
                              'assert os.access("/etc/imunify-discord/alert.py", os.X_OK)'],
@@ -155,7 +155,6 @@ class Transaction:
         self.agent = agent
         self.old_target = show(agent)
         self.backup = Path(tempfile.mkdtemp(prefix='imunify-discord-rollback-'))
-        self.old_cron = None
         self.cron_changed = False
         self.notify_changed = False
         self.had_root = ROOT.exists()
@@ -209,6 +208,23 @@ class Transaction:
         return not errors
 
 
+def validate_state_path(path):
+    """Never read privileged configuration through links or untrusted paths."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode):
+        raise RuntimeError('Refusing symbolic link: ' + str(path))
+    if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+        raise RuntimeError('Expected regular file or directory: ' + str(path))
+    if info.st_uid != 0 or info.st_mode & 0o022:
+        raise RuntimeError('Require root ownership and no group/other write permission: ' + str(path))
+    if stat.S_ISDIR(info.st_mode):
+        for child in path.iterdir():
+            validate_state_path(child)
+
+
 def preflight(install=True):
     if sys.platform != 'linux' or os.geteuid() != 0:
         raise RuntimeError('Run as root on a Linux server.')
@@ -226,9 +242,8 @@ def preflight(install=True):
     agent = shutil.which('imunify-antivirus')
     if not agent:
         raise RuntimeError('Install and configure ImunifyAV first; imunify-antivirus was not found.')
-    for path in [ROOT, CRON] + ([*ROOT.iterdir()] if ROOT.is_dir() else []):
-        if path.is_symlink():
-            raise RuntimeError('Refusing symbolic link: ' + str(path))
+    for path in (ROOT, CRON):
+        validate_state_path(path)
     checks = [['notifications-config', 'update', '--help']]
     if install:
         checks.append(['malware', 'on-demand', 'start', '--help'])
@@ -296,7 +311,7 @@ def deploy(args, agent, transaction):
         command(['crontab', str(transaction.backup / 'new-crontab')])
     cron = ('# Managed by imunify-discord; edit config.env and rerun update.sh.\n'
             'SHELL=/bin/sh\nPATH=/usr/sbin:/usr/bin:/sbin:/bin\n' + config['SCAN_CRON'] +
-            ' root /usr/bin/flock -n /run/imunify-discord-scan.lock /usr/bin/python3 /etc/imunify-discord/scan.py\n')
+            ' root /usr/bin/flock -n /run/imunify-discord-scan.lock /usr/bin/python3 -I /etc/imunify-discord/scan.py\n')
     if shutil.which('flock') != '/usr/bin/flock' and not Path('/usr/bin/flock').exists():
         raise RuntimeError('Require flock at /usr/bin/flock.')
     write(CRON, cron, 0o644)

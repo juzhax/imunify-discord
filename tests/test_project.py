@@ -3,6 +3,7 @@ import copy
 import io
 import json
 import os
+import stat
 from pathlib import Path
 import subprocess
 import sys
@@ -17,6 +18,45 @@ import scan
 
 
 class ProjectTests(unittest.TestCase):
+    def test_state_paths_reject_unsafe_permissions_ownership_and_types(self):
+        for mode, uid in ((stat.S_IFREG | 0o660, 0), (stat.S_IFREG | 0o644, 1000),
+                          (stat.S_IFIFO | 0o600, 0), (stat.S_IFLNK | 0o777, 0)):
+            info = os.stat_result((mode, 0, 0, 1, uid, 0, 0, 0, 0, 0))
+            with self.subTest(mode=mode, uid=uid), patch.object(Path, 'lstat', return_value=info):
+                with self.assertRaises(RuntimeError):
+                    manage.validate_state_path(Path('/example/config'))
+        safe = os.stat_result((stat.S_IFREG | 0o640, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        with patch.object(Path, 'lstat', return_value=safe):
+            manage.validate_state_path(Path('/example/config'))
+
+    def test_nested_symlink_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            link = root / 'nested-link'
+            link.symlink_to('/etc/passwd')
+            # Walk a trusted root directory regardless of the test runner uid.
+            original_lstat = Path.lstat
+            def root_owned(path):
+                info = original_lstat(path)
+                fields = list(info)
+                fields[4] = 0
+                return os.stat_result(fields)
+            with patch.object(Path, 'lstat', root_owned):
+                with self.assertRaisesRegex(RuntimeError, 'symbolic link'):
+                    manage.validate_state_path(root)
+
+    def test_delivery_disables_proxies_and_redirects(self):
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value.status = 204
+        opener = unittest.mock.MagicMock()
+        opener.open.return_value = response
+        with patch.object(alert.urllib.request, 'build_opener', return_value=opener) as build:
+            alert.send(alert.payload(test=True), 'https://discord.com/api/webhooks/123/synthetic_test_value')
+        handlers = build.call_args.args
+        self.assertEqual(handlers[0].proxies, {})
+        self.assertIsNone(handlers[1].redirect_request(None, None, 302, '', {}, 'https://example.invalid'))
+        self.assertEqual(opener.open.call_args.kwargs['timeout'], 20)
+
     def test_webhook_rejects_exfiltration_and_queries(self):
         for url in ('http://discord.com/api/webhooks/1/x',
                     'https://discord.com.evil.example/api/webhooks/1/x',

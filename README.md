@@ -118,7 +118,6 @@ does not cancel active scans or modify the built-in background schedule.
 The installer keeps the existing paths `/etc/imunify-discord/alert.py` and
 `/etc/imunify-discord/webhook`. It replaces the old script, reuses the webhook,
 repairs access permissions, and deduplicates that script's notification entry.
-There is no server-specific hostname in the code.
 
 Plain root-crontab entries running `imunify-antivirus malware on-demand start
 --path /home` (or `--path=/home`, with an optional `/dev/null` output redirect)
@@ -146,6 +145,15 @@ keep server secrets outside Git. Root and the notifier access group can read
 the webhook. Python uses validated Discord HTTPS endpoints, system TLS
 verification, a 20-second request timeout, no proxy environment configuration,
 and no redirects. Error messages omit URLs, response bodies and raw exceptions.
+
+Before reading existing deployment state, the installer rejects symbolic links,
+special files, non-root ownership, and group/other write permissions throughout
+the configuration directory and on the managed cron file. Correct ownership and
+permissions as root before retrying an installation that fails these checks.
+Installed hooks and cron scans use Python isolated mode, ignoring Python
+environment overrides and user site packages. Run installation/update only from
+a trusted, reviewed checkout; installer Python ignores Python environment overrides
+and user site packages while allowing its own local modules.
 
 Alerts deliberately send only the hostname and a generic malware-found message.
 File paths, event JSON and file contents are not forwarded to Discord. Inspect

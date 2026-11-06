@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -I
 """Start one on-demand scan. Called under flock by the managed cron job."""
 import subprocess
 import sys

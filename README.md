@@ -32,7 +32,49 @@ sudo apt-get install git curl jq util-linux coreutils cron ca-certificates
 sudo systemctl enable --now cron
 ```
 
-## Install
+## If ImunifyAV is not installed yet
+
+Check whether the agent is already available:
+
+```bash
+command -v imunify-antivirus
+```
+
+If it exists, skip to [Install Discord alerts](#install-discord-alerts). Otherwise,
+follow the [official ImunifyAV installation guide](https://docs.imunify360.com/imunifyav/)
+for your supported OS/panel combination. For DirectAdmin, run these steps in a
+root shell (`sudo -i` if needed):
+
+1. Download the vendor installer into a private directory, separate from this project:
+
+   ```bash
+   install -d -m 0700 /root/imunifyav-installer
+   cd /root/imunifyav-installer
+   curl -fSL --proto '=https' --proto-redir '=https' \
+     https://repo.imunify360.cloudlinux.com/defence360/imav-deploy.sh \
+     --output imav-deploy.sh
+   ```
+
+2. Review the downloaded script, then run it:
+
+   ```bash
+   bash imav-deploy.sh
+   ```
+
+3. Confirm that the agent is installed and registered:
+
+   ```bash
+   imunify-antivirus version
+   imunify-antivirus rstatus
+   ```
+
+For Hestia, centminmod or another generic/no-panel setup, follow the official
+[standalone integration guide](https://docs.imunify360.com/imunifyav/stand_alone_mode/)
+for UI, users and authentication setup. Then confirm the agent commands above
+work before installing this project's alerts. Panel integration is not created
+by `imunify-discord`.
+
+## Install Discord alerts
 
 Use `/opt/imunify-discord` for the root-owned checkout and keep configuration in
 `/etc/imunify-discord`. Do not clone into the configuration directory. Commands
@@ -96,6 +138,64 @@ cron commands using the known `python3 ... scan.py` invocation are switched to
 `/bin/bash /etc/imunify-discord/scan.sh`, retaining their schedule and lock.
 The old installed `scan.py` is removed. No Python interpreter is called at runtime.
 An unrecognized legacy cron invocation stops the update for administrator review.
+
+## Common ImunifyAV commands
+
+Commands from the [official CLI reference](https://docs.imunify360.com/imunifyav/cli/).
+Omit `sudo` as root; replace `example-user` with an actual account.
+
+1. Check version, registration and update malware signatures:
+
+   ```bash
+   sudo imunify-antivirus version
+   sudo imunify-antivirus rstatus
+   sudo imunify-antivirus update sign
+   ```
+
+2. Start a low-intensity scan of `/home`:
+
+   ```bash
+   sudo imunify-antivirus malware on-demand start --path /home \
+     --no-follow-symlinks --intensity-cpu 2 --intensity-io 2
+   ```
+
+   Or scan just one account instead:
+
+   ```bash
+   sudo imunify-antivirus malware on-demand start --path /home/example-user \
+     --no-follow-symlinks --intensity-cpu 2 --intensity-io 2
+   ```
+
+   These start real scans. Completion is asynchronous; malware findings can
+   trigger Discord alerts. Existing agent remediation policies still apply.
+
+3. Check scan status and history:
+
+   ```bash
+   sudo imunify-antivirus malware on-demand status
+   sudo imunify-antivirus malware on-demand list
+   ```
+
+4. List account status and findings:
+
+   ```bash
+   sudo imunify-antivirus malware user list
+   sudo imunify-antivirus malware malicious list --limit 100
+   sudo imunify-antivirus malware malicious list --user example-user --limit 100
+   ```
+
+   Add `--json` for JSON or `--offset 100` for the next page. Listing does not
+   clean or remove files.
+
+5. Interrupt an on-demand scan (optional):
+
+   ```bash
+   sudo imunify-antivirus malware on-demand stop
+   ```
+
+   For installed-version options, run
+   `sudo imunify-antivirus malware on-demand start --help` or
+   `sudo imunify-antivirus malware malicious list --help`.
 
 ## Configuration and scan schedule
 

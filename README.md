@@ -27,11 +27,11 @@ On systems using systemd, it checks that `cron` or `crond` is active.
 
 ```bash
 # AlmaLinux (install ImunifyAV separately)
-sudo dnf install python3 util-linux cronie ca-certificates
+sudo dnf install git python3 util-linux cronie ca-certificates
 sudo systemctl enable --now crond
 
 # Ubuntu (install ImunifyAV separately)
-sudo apt-get install python3 util-linux cron ca-certificates
+sudo apt-get install git python3 util-linux cron ca-certificates
 sudo systemctl enable --now cron
 ```
 
@@ -44,14 +44,31 @@ it does not change ImunifyAV's execution identity.
 
 ## Install and test
 
-1. Clone and inspect the project:
+Use the same directory layout on each server:
+
+| Directory | Purpose |
+| --- | --- |
+| `/opt/imunify-discord` | Root-owned Git checkout: source, installer, updates, tests and documentation |
+| `/etc/imunify-discord` | Webhook, configuration and installed runtime scripts managed by the installer |
+| `/etc/cron.d/imunify-discord` | Managed scan schedule |
+
+Keep an existing `/etc/imunify-discord` directory in place. Clone the source into
+`/opt/imunify-discord`; the installer reuses the existing webhook and preserves
+configuration. Keep webhook secrets outside the Git checkout. Commands below
+use `sudo`; when already logged in as root, omit `sudo`.
+
+1. Clone and inspect the project in `/opt`:
 
    ```bash
-   git clone https://github.com/juzhax/imunify-discord.git
-   cd imunify-discord
+   sudo git clone https://github.com/juzhax/imunify-discord.git /opt/imunify-discord
+   cd /opt/imunify-discord
    ```
 
-2. Install from the local checkout:
+   If this checkout already exists, use the update commands below instead of
+   cloning over it. An older checkout elsewhere can be left in place while you
+   create this checkout; leave `/etc/imunify-discord` untouched.
+
+2. Install from `/opt/imunify-discord`:
 
    ```bash
    sudo bash install.sh
@@ -72,6 +89,10 @@ it does not change ImunifyAV's execution identity.
    Use your verified notifier identity if different. This sends a test message
    without starting a scan or creating a malware sample. It tests Discord and
    file access; it does not synthesize an ImunifyAV event.
+
+Validate on one staging server first, then repeat these steps on each server.
+Each server uses its own system hostname and local configuration. Run the safe
+test and confirm the scan path, schedule and intensity on each deployment.
 
 ## Configuration and updates
 
@@ -96,9 +117,15 @@ set `SCAN_PATH` if your deployment stores websites elsewhere.
 After editing configuration, or after fetching reviewed project updates:
 
 ```bash
-git pull --ff-only
+cd /opt/imunify-discord
+sudo git pull --ff-only
 sudo bash update.sh
 ```
+
+The checkout is root-owned, so use `sudo` for Git updates as shown. Repeat the
+update and safe delivery test on each server after validating the change on
+staging. After editing only `config.env`, run `sudo bash update.sh` from this
+directory to apply the schedule; fetching source updates is optional.
 
 Updates use the same transactional installer, require an existing webhook,
 retain `config.env` contents and reuse the secret. Changing the schedule requires
@@ -199,6 +226,7 @@ use the `USER_SCAN_*` family and are outside this project's registration.
 ## Uninstall
 
 ```bash
+cd /opt/imunify-discord
 sudo bash uninstall.sh
 ```
 

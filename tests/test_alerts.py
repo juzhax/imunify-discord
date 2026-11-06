@@ -64,6 +64,15 @@ class AlertParsingTests(unittest.TestCase):
         event = alert.normalize({'malicious_files': {'/home/example-user/bad.php': 'EXAMPLE-SIGNATURE'}})
         self.assertEqual(event['records'][0]['signature'], 'EXAMPLE-SIGNATURE')
 
+    def test_scan_type_is_not_mistaken_for_a_malware_signature(self):
+        events = []
+        for event_type, kind in zip(alert.EVENTS, ('on-demand', 'user')):
+            event = alert.normalize({'event_id': event_type, 'type': kind, 'scan_id': 'example-scan',
+                                     'file_path': '/home/example-user/bad.php'})
+            self.assertEqual(event['records'][0]['signature'], '')
+            events.append(event)
+        self.assertEqual(alert.fingerprints(events[0]), alert.fingerprints(events[1]))
+
     def test_redaction_message_limits_and_arbitrary_fields_excluded(self):
         raw = example()
         raw['unrelated-secret'] = 'must-never-forward'

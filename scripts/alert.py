@@ -77,9 +77,12 @@ def normalize(raw):
             return
         record = {'path': first(item, 'path', 'file', 'filename', 'file_path'),
                   'user': first(item, 'username', 'user', 'owner') or owner,
-                  'signature': first(item, 'signature', 'malware_name', 'threat', 'type'),
+                  'signature': first(item, 'signature', 'malware_name', 'threat'),
                   'hash': first(item, 'sha256', 'hash', 'checksum'),
                   'id': first(item, 'detection_id', 'id')}
+        kind = first(item, 'type')
+        if not record['signature'] and kind not in EVENTS + ('user', 'background', 'on-demand', 'custom'):
+            record['signature'] = kind
         record['user'] = record['user'] or path_user(record['path']) or user
         if any(record[k] for k in ('path', 'signature', 'hash', 'id')):
             records.append(record)

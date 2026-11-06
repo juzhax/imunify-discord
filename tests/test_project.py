@@ -16,8 +16,34 @@ import alert
 import manage
 import scan
 
+LEGACY_JOB = ('0 3 * * * root /usr/bin/flock -n /run/imunifyav-nightly.lock '
+              '/usr/bin/imunify-antivirus malware on-demand start --path /home '
+              '--no-follow-symlinks --intensity-cpu 2 --intensity-io 2 '
+              '>> /var/log/imunifyav-nightly.log 2>&1\n')
+
 
 class ProjectTests(unittest.TestCase):
+    def test_explicit_migration_preserves_unrelated_entries_and_is_repeatable(self):
+        config = {'SCAN_CRON': '0 3 * * *', 'SCAN_PATH': '/home', 'SCAN_CPU': '2', 'SCAN_IO': '2'}
+        remaining = '# existing comment\n0 1 * * * root /usr/bin/backup\n'
+        result = manage.migrate_cron_text(remaining + LEGACY_JOB, config, '/usr/bin/imunify-antivirus')
+        self.assertEqual(result, remaining)
+        self.assertEqual(manage.migrate_cron_text(result, config, '/usr/bin/imunify-antivirus'), result)
+
+    def test_explicit_migration_rejects_different_settings_and_shell_commands(self):
+        config = {'SCAN_CRON': '0 3 * * *', 'SCAN_PATH': '/home', 'SCAN_CPU': '2', 'SCAN_IO': '2'}
+        for job in (LEGACY_JOB.replace('0 3', '0 4'), LEGACY_JOB.replace('--intensity-cpu 2', '--intensity-cpu 7'),
+                    LEGACY_JOB.replace('--no-follow-symlinks', '--follow-symlinks'),
+                    LEGACY_JOB.rstrip() + '; /usr/bin/other\n', LEGACY_JOB + LEGACY_JOB,
+                    LEGACY_JOB.replace('/var/log/imunifyav-nightly.log', '/tmp/untrusted.log')):
+            with self.subTest(job=job), self.assertRaises(RuntimeError):
+                manage.migrate_cron_text(job, config, '/usr/bin/imunify-antivirus')
+
+    def test_explicit_migration_rejects_paths_outside_cron_directory(self):
+        for value in ('/tmp/legacy', 'legacy', '/etc/cron.d/../legacy', '/etc/cron.d/imunify-discord', '/etc/cron.d/..'):
+            with self.subTest(value=value), self.assertRaises(RuntimeError):
+                manage.plan_cron_migration(value, {}, 'agent')
+
     def test_secure_prompt_opens_real_nonseekable_terminal(self):
         # Isolate terminal/session side effects from the test runner itself.
         code = '''
@@ -143,6 +169,7 @@ finally:
             args = run.call_args.args[0]
             self.assertEqual(args[1:4], ['malware', 'on-demand', 'start'])
             self.assertNotIn('cleanup', args)
+            self.assertIn('--no-follow-symlinks', args)
             config.write_text(config.read_text() + 'EVIL=$(touch /tmp/bad)\n')
             with self.assertRaises(ValueError):
                 scan.read_config(config)
@@ -211,7 +238,7 @@ finally:
 
 
 class DeploymentTests(unittest.TestCase):
-    def exercise_deployment(self, fail=False, prompt=False):
+    def exercise_deployment(self, fail=False, prompt=False, migrate=False):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             root = base / 'config'
@@ -228,6 +255,11 @@ class DeploymentTests(unittest.TestCase):
             cron_dir.mkdir()
             cron = cron_dir / 'imunify-discord'
             cron.write_text('old cron\n')
+            legacy = cron_dir / 'legacy-nightly'
+            legacy_remaining = '# keep\n0 1 * * * root /usr/bin/backup\n'
+            legacy_original = legacy_remaining + LEGACY_JOB.replace('0 3 * * *', '0 3 * * 1').replace('--path /home', '--path ' + tmp).replace('--intensity-cpu 2', '--intensity-cpu 1').replace('--intensity-io 2', '--intensity-io 3')
+            if migrate:
+                legacy.write_text(legacy_original)
             state = {'target': {'enabled': True, 'scripts': ['/opt/other', manage.HOOK, manage.HOOK]}}
             original_target = copy.deepcopy(state['target'])
             def fake_command(args, **kwargs):
@@ -241,7 +273,8 @@ class DeploymentTests(unittest.TestCase):
                     return subprocess.CompletedProcess(args, 0, '0 1 * * * /usr/bin/backup\n', '')
                 raise AssertionError(args)
             user = type('User', (), {'pw_name': '_imunify', 'pw_uid': 100, 'pw_gid': 100})()
-            args = type('Args', (), {'notification_user': None, 'update': not prompt})()
+            args = type('Args', (), {'notification_user': None, 'update': not prompt,
+                                    'migrate_cron': str(legacy) if migrate else None})()
             original_write = manage.write
             failed = False
             def maybe_fail(path, *args, **kwargs):
@@ -254,6 +287,7 @@ class DeploymentTests(unittest.TestCase):
                  patch.object(manage, 'command', side_effect=fake_command), \
                  patch.object(manage, 'identity', return_value=(user, 100, [100])), \
                  patch.object(manage, 'check_access'), \
+                 patch.object(manage, 'validate_state_path'), \
                  patch.object(manage, 'prompt_webhook', return_value=secret.strip()) as prompt_call, \
                  patch.object(manage.shutil, 'which', return_value='/usr/bin/flock'), \
                  patch.object(manage, 'write', side_effect=maybe_fail), \
@@ -275,12 +309,16 @@ class DeploymentTests(unittest.TestCase):
                     self.assertEqual((root / 'alert.py').read_text(), 'old script')
                     self.assertEqual(cron.read_text(), 'old cron\n')
                     self.assertFalse((root / 'scan.py').exists())
+                    if migrate:
+                        self.assertEqual(legacy.read_text(), legacy_original)
                 else:
                     self.assertEqual(state['target']['scripts'], ['/opt/other', manage.HOOK])
                     self.assertEqual(cron.read_text().count(' root '), 1)
                     self.assertIn('0 3 * * 1 root', cron.read_text())
                     self.assertEqual((root / 'webhook').stat().st_mode & 0o777, 0o640)
                     self.assertEqual((root / 'alert.py').stat().st_mode & 0o777, 0o750)
+                    if migrate:
+                        self.assertEqual(legacy.read_text(), legacy_remaining)
 
     def test_repeat_update_preserves_secret_config_and_other_hooks(self):
         self.exercise_deployment()
@@ -290,6 +328,12 @@ class DeploymentTests(unittest.TestCase):
 
     def test_install_without_webhook_prompts_once_then_reuses_secret(self):
         self.exercise_deployment(prompt=True)
+
+    def test_install_migrates_selected_cron_and_preserves_config(self):
+        self.exercise_deployment(migrate=True)
+
+    def test_failed_install_restores_selected_cron(self):
+        self.exercise_deployment(fail=True, migrate=True)
 
 
 if __name__ == '__main__':

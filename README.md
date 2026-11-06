@@ -110,7 +110,8 @@ SCAN_IO=2
 `SCAN_CRON` accepts five numeric cron fields, including lists, ranges and steps.
 For weekly scans use `0 3 * * 0`; for every six hours use `0 */6 * * *`.
 CPU and I/O intensity range from **1 (lowest) to 7 (highest)**. They apply only
-to this project's on-demand scans. The scan directory must already exist.
+to this project's on-demand scans. Managed scans explicitly use
+`--no-follow-symlinks`. The scan directory must already exist.
 On DirectAdmin, Hestia and centminmod, confirm that `/home` covers your content;
 set `SCAN_PATH` if your deployment stores websites elsewhere.
 
@@ -152,8 +153,32 @@ are migrated to the single `/etc/cron.d/imunify-discord` job. Other root cron
 entries are preserved. The project's own cron file is replaced atomically.
 
 More complex root-crontab commands or `/home` scans in another `/etc/cron.d`
-file cause installation to stop with the file/location identified. Review and
-remove the superseded job before rerunning installation. Jobs in other users'
+file cause installation to stop with the file/location identified. For a
+compatible existing cron.d job, select that file explicitly:
+
+```bash
+cd /opt/imunify-discord
+sudo git pull --ff-only
+sudo bash install.sh --migrate-cron /etc/cron.d/imunifyav-nightly
+```
+
+This supports a root on-demand command with `--path`, `--no-follow-symlinks`,
+`--intensity-cpu` and `--intensity-io` in that order. An optional prefix
+`/usr/bin/flock -n /run/NAME.lock` (also `/var/run`) and trailing
+`>> /var/log/NAME.log 2>&1` or `/dev/null` redirection are recognized. The schedule,
+scan path and both intensities must match the effective `config.env` values
+(or the example defaults on first installation). Unsupported commands, differing
+settings and multiple scan entries stop migration without removing the old job.
+
+Only the matching entry is removed from the selected file; comments and unrelated
+entries remain. The new managed cron file becomes the sole scan schedule for that
+entry. The selected file is privately backed up during installation and restored
+if installation fails. Repeating the same migration option is safe. Existing log
+files are retained; the new job uses normal cron output handling instead of the
+old log redirection. Cron checks run before asking for a new webhook.
+
+For other command formats, review and remove only the superseded job before
+rerunning installation. Jobs in other users'
 crontabs, systemd timers, or external schedulers need separate administrator
 review. Built-in ImunifyAV schedules are intentionally retained.
 
@@ -227,7 +252,7 @@ Implementation was checked against the official
 ```text
 imunify-antivirus notifications-config show --json
 imunify-antivirus notifications-config update '{"rules":{"CUSTOM_SCAN_MALWARE_FOUND":{"SCRIPT":{"enabled":true,"scripts":["/etc/imunify-discord/alert.py"]}}}}'
-imunify-antivirus malware on-demand start --path /home --intensity-cpu 2 --intensity-io 2
+imunify-antivirus malware on-demand start --path /home --no-follow-symlinks --intensity-cpu 2 --intensity-io 2
 ```
 
 The JSON above illustrates the API; the installer reads the current target and

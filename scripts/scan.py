@@ -47,7 +47,7 @@ def run(config, agent):
     # start is asynchronous. flock serializes submissions only; ImunifyAV owns
     # the scan lifecycle and handles its queue/busy state.
     result = subprocess.run([agent, 'malware', 'on-demand', 'start',
-                             '--path', config['SCAN_PATH'], '--intensity-cpu', config['SCAN_CPU'],
+                             '--path', config['SCAN_PATH'], '--no-follow-symlinks', '--intensity-cpu', config['SCAN_CPU'],
                              '--intensity-io', config['SCAN_IO']], stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, timeout=120)
     if result.returncode:

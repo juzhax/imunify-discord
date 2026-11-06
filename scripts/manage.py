@@ -8,6 +8,7 @@ import grp
 import json
 import os
 import pwd
+import shlex
 import shutil
 import signal
 import stat
@@ -18,7 +19,7 @@ import warnings
 from pathlib import Path
 
 from alert import validate_webhook
-from scan import read_config
+from scan import read_config, validate_cron
 
 ROOT = Path('/etc/imunify-discord')
 CRON = Path('/etc/cron.d/imunify-discord')
@@ -125,7 +126,6 @@ def check_access(user, groups):
 
 def legacy_crontab(text):
     """Migrate only the simple legacy /home job. Fail closed on ambiguity."""
-    import shlex
     kept = []
     for line in text.splitlines():
         if line.lstrip().startswith('#') or not line.strip():
@@ -151,6 +151,64 @@ def legacy_crontab(text):
     return '\n'.join(kept) + ('\n' if kept else '')
 
 
+def migrate_cron_text(text, config, agent):
+    """Remove only a recognized scan equivalent to the new managed job."""
+    kept = []
+    found = 0
+    for line in text.splitlines(keepends=True):
+        if line.lstrip().startswith('#') or 'imunify-antivirus' not in line or 'on-demand' not in line:
+            kept.append(line)
+            continue
+        try:
+            fields = line.split(None, 6)
+            schedule = ' '.join(fields[:5])
+            validate_cron(schedule)
+            if len(fields) != 7 or fields[5] != 'root' or schedule != ' '.join(config['SCAN_CRON'].split()):
+                raise ValueError()
+            words = shlex.split(fields[6])
+            if len(words) >= 3 and words[-3] == '>>' and words[-1] == '2>&1':
+                log = Path(words[-2])
+                if not log.is_absolute() or log.parent != Path('/var/log'):
+                    raise ValueError()
+                words = words[:-3]
+            for suffix in (['>/dev/null', '2>&1'], ['>', '/dev/null', '2>&1']):
+                if words[-len(suffix):] == suffix:
+                    words = words[:-len(suffix)]
+            if words[:2] == ['/usr/bin/flock', '-n']:
+                if Path(words[2]).parent not in (Path('/run'), Path('/var/run')):
+                    raise ValueError()
+                words = words[3:]
+            if not words or words[0] not in (agent, '/usr/bin/imunify-antivirus'):
+                raise ValueError()
+            expected = ['malware', 'on-demand', 'start', '--path', config['SCAN_PATH'],
+                        '--no-follow-symlinks', '--intensity-cpu', config['SCAN_CPU'],
+                        '--intensity-io', config['SCAN_IO']]
+            if words[1:] != expected:
+                raise ValueError()
+        except (IndexError, ValueError):
+            raise RuntimeError('Legacy cron command or settings differ from the managed scan. No migration performed; review config.env and the selected cron file.') from None
+        found += 1
+    if found > 1:
+        raise RuntimeError('Multiple scan entries in selected cron file; review them before migration.')
+    return ''.join(kept)
+
+
+def plan_cron_migration(value, config, agent):
+    if not value:
+        return None
+    path = Path(value)
+    if not path.is_absolute() or path.parent != CRON.parent or path == CRON or path.name in ('.', '..'):
+        raise RuntimeError('--migrate-cron must name another file directly inside /etc/cron.d.')
+    if path.is_dir() and not path.is_symlink():
+        raise RuntimeError('Selected legacy cron path must be a regular file.')
+    validate_state_path(path)
+    if not path.is_file():
+        raise RuntimeError('Selected legacy cron file does not exist or is not a regular file.')
+    original = path.read_bytes().decode('utf-8')
+    replacement = migrate_cron_text(original, config, agent)
+    return path, original, replacement
+
+
 class Transaction:
     def __init__(self, agent):
         self.agent = agent
@@ -158,6 +216,8 @@ class Transaction:
         self.backup = Path(tempfile.mkdtemp(prefix='imunify-discord-rollback-'))
         self.cron_changed = False
         self.notify_changed = False
+        self.legacy_changed = False
+        self.legacy_path = None
         self.had_root = ROOT.exists()
         self.root_stat = ROOT.stat() if self.had_root else None
         self.owners = {}
@@ -201,6 +261,12 @@ class Transaction:
                 command(['crontab', str(self.backup / 'root-crontab')])
             except Exception:
                 errors.append('root crontab')
+        if self.legacy_changed:
+            try:
+                write(self.legacy_path, (self.backup / 'legacy-cron').read_bytes(),
+                      stat.S_IMODE(self.legacy_stat.st_mode), self.legacy_stat.st_gid)
+            except Exception:
+                errors.append('selected legacy cron file')
         if errors:
             print('Error: rollback incomplete for ' + ', '.join(errors) +
                   '. Protected backup retained at ' + str(self.backup), file=sys.stderr)
@@ -250,7 +316,7 @@ def preflight(install=True):
         checks.append(['malware', 'on-demand', 'start', '--help'])
     for args in checks:
         help_text = command([agent] + args).stdout
-        if args[0] == 'malware' and any(flag not in help_text for flag in ('--path', '--intensity-cpu', '--intensity-io')):
+        if args[0] == 'malware' and any(flag not in help_text for flag in ('--path', '--no-follow-symlinks', '--intensity-cpu', '--intensity-io')):
             raise RuntimeError('Installed ImunifyAV lacks required on-demand scan options.')
     return agent
 
@@ -296,6 +362,23 @@ def deploy(args, agent, transaction):
             raise RuntimeError('Invalid config.env: ' + str(exc)) from None
     else:
         config = read_config(SOURCE / 'config.example.env')
+    transaction.stage = 'existing cron validation'
+    root_tab = command(['crontab', '-l'], ok=(0, 1))
+    if root_tab.returncode == 1 and ('no crontab for' not in root_tab.stderr or root_tab.stdout):
+        raise RuntimeError('Unable to read root crontab.')
+    migrated = legacy_crontab(root_tab.stdout)
+    plan = plan_cron_migration(getattr(args, 'migrate_cron', None), config, agent)
+    # Do not silently duplicate a separately managed cron.d scan.
+    for path in CRON.parent.iterdir():
+        if path == CRON or (plan and path == plan[0]) or not path.is_file():
+            continue
+        for line in path.read_text(errors='replace').splitlines():
+            if not line.lstrip().startswith('#') and 'imunify-antivirus' in line and 'on-demand' in line and '/home' in line:
+                raise RuntimeError('Unmanaged /home scan found in ' + str(path) + '; review it, then select it with --migrate-cron FILE.')
+    if plan and plan[1] != plan[2]:
+        transaction.legacy_path = plan[0]
+        transaction.legacy_stat = plan[0].stat()
+        write(transaction.backup / 'legacy-cron', plan[1], 0o600)
     existing = ROOT / 'webhook'
     transaction.stage = 'webhook loading'
     if existing.exists():
@@ -306,18 +389,6 @@ def deploy(args, agent, transaction):
     else:
         transaction.stage = 'secure webhook prompt'
         secret = prompt_webhook()
-    transaction.stage = 'existing cron validation'
-    root_tab = command(['crontab', '-l'], ok=(0, 1))
-    if root_tab.returncode == 1 and ('no crontab for' not in root_tab.stderr or root_tab.stdout):
-        raise RuntimeError('Unable to read root crontab.')
-    migrated = legacy_crontab(root_tab.stdout)
-    # Do not silently duplicate a separately managed cron.d scan.
-    for path in CRON.parent.iterdir():
-        if path == CRON or not path.is_file():
-            continue
-        for line in path.read_text(errors='replace').splitlines():
-            if not line.lstrip().startswith('#') and 'imunify-antivirus' in line and 'on-demand' in line and '/home' in line:
-                raise RuntimeError('Unmanaged /home scan found in ' + str(path) + '; migrate it before installing.')
     transaction.stage = 'runtime file installation'
     ROOT.mkdir(mode=0o750, exist_ok=True)
     os.chown(ROOT, 0, gid)
@@ -342,6 +413,12 @@ def deploy(args, agent, transaction):
         write(transaction.backup / 'new-crontab', migrated, 0o600)
         transaction.cron_changed = True
         command(['crontab', str(transaction.backup / 'new-crontab')])
+    if plan and plan[1] != plan[2]:
+        transaction.stage = 'selected legacy cron migration'
+        if plan[0].read_bytes().decode('utf-8') != plan[1]:
+            raise RuntimeError('Legacy cron file changed during installation; retry after reviewing it.')
+        transaction.legacy_changed = True
+        write(plan[0], plan[2], stat.S_IMODE(transaction.legacy_stat.st_mode), transaction.legacy_stat.st_gid)
     transaction.stage = 'scan schedule installation'
     cron = ('# Managed by imunify-discord; edit config.env and rerun update.sh.\n'
             'SHELL=/bin/sh\nPATH=/usr/sbin:/usr/bin:/sbin:/bin\n' + config['SCAN_CRON'] +
@@ -357,7 +434,10 @@ def main():
     parser.add_argument('action', choices=('install', 'uninstall'))
     parser.add_argument('--update', action='store_true')
     parser.add_argument('--notification-user', help='override verified notifier identity (default: _imunify)')
+    parser.add_argument('--migrate-cron', metavar='FILE', help='migrate an equivalent scan from a selected /etc/cron.d file')
     args = parser.parse_args()
+    if args.migrate_cron and args.action != 'install':
+        parser.error('--migrate-cron is available only for install/update')
     def interrupted(signum, frame):
         raise RuntimeError('Interrupted; installation rollback attempted.')
     signal.signal(signal.SIGTERM, interrupted)

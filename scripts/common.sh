@@ -1,5 +1,7 @@
 #!/bin/bash
 # Shared Linux helpers. Configuration is parsed as data, never sourced/evaluated.
+# These globals are consumed by the scripts sourcing this library.
+# shellcheck disable=SC2034
 EVENT_CUSTOM=CUSTOM_SCAN_MALWARE_FOUND
 EVENT_USER=USER_SCAN_MALWARE_FOUND
 HOOK=/etc/imunify-discord/alert.py
@@ -40,7 +42,7 @@ validate_cron() {
 read_config() {
     local file=$1 line key value
     local -A seen=()
-    SCAN_CRON= SCAN_PATH= SCAN_CPU= SCAN_IO=
+    SCAN_CRON='' SCAN_PATH='' SCAN_CPU='' SCAN_IO=''
     while IFS= read -r line || [[ -n $line ]]; do
         [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
         [[ $line == *=* ]] || { error 'Invalid configuration line.'; return 1; }
@@ -70,7 +72,9 @@ trusted_path() {
     [[ -e $path ]] || return 0
     [[ -f $path || -d $path ]] || { error "Not a regular file/directory: $path"; return 1; }
     read -r owner mode < <(stat -c '%u %a' -- "$path")
-    [[ $owner == 0 ]] && (( (8#$mode & 8#022) == 0 )) || { error "Require root ownership and no group/other writes: $path"; return 1; }
+    if [[ $owner != 0 ]] || (( (8#$mode & 8#022) != 0 )); then
+        error "Require root ownership and no group/other writes: $path"; return 1
+    fi
 }
 
 notification_show() {

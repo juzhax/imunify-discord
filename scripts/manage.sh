@@ -4,6 +4,7 @@ set -Eeuo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C
 MANAGER_BASE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=scripts/common.sh
 source "$MANAGER_BASE/scripts/common.sh"
 
 atomic_file() {
@@ -29,6 +30,10 @@ manager_exit() {
         fi
         if [[ ${ROOT_CRON_TOUCHED:-false} == true ]]; then crontab "$BACKUP/root-crontab" || failed=true; fi
         if [[ ${LEGACY_TOUCHED:-false} == true ]]; then cp -a -- "$BACKUP/legacy-cron" "$MIGRATE_CRON" || failed=true; fi
+        if [[ ${STATE_TOUCHED:-false} == true ]]; then
+            if [[ $STATE_CREATED == true ]]; then rmdir -- "$STATE" || failed=true
+            else chown "$STATE_OWNER:$STATE_GROUP" "$STATE" && chmod "$STATE_MODE" "$STATE" || failed=true; fi
+        fi
         if [[ $failed == true ]]; then printf 'Error: rollback incomplete. Protected backup: %s\n' "$BACKUP" >&2; BACKUP=; fi
     fi
     [[ -z ${BACKUP:-} ]] || rm -rf -- "$BACKUP"
@@ -61,7 +66,7 @@ filter_cron() {
 }
 
 manager_main() {
-    local action=${1:-install} update=false verify=false refresh=false user_override= dependency path help_file desired group uid user mode stage_config
+    local action=${1:-install} update=false verify=false refresh=false user_override='' dependency path help_file desired group uid user mode stage_config
     shift || true
     MIGRATE_CRON=
     while (($#)); do
@@ -95,6 +100,7 @@ manager_main() {
     flock -n 9 || { error 'Another installer is running.'; return 1; }
     umask 077
     STAGE='notification and file backup'; COMMITTED=false; NOTIFY_TOUCHED=false; FILES_TOUCHED=false; ROOT_CRON_TOUCHED=false; LEGACY_TOUCHED=false
+    STATE_TOUCHED=false; STATE_CREATED=false
     OLD_TARGETS=$(notification_show)
     BACKUP=$(mktemp -d)
     trap 'manager_exit $?' EXIT
@@ -160,7 +166,9 @@ manager_main() {
         [[ -d $STATE ]] || { error 'Duplicate state must be a directory.'; return 1; }
         path=$(stat -c %u -- "$STATE")
         [[ $path == 0 || $path == "$uid" ]] || { error 'Untrusted duplicate state owner.'; return 1; }
-    else mkdir -p -- "$STATE"; fi
+        read -r STATE_OWNER STATE_GROUP STATE_MODE < <(stat -c '%u %g %a' -- "$STATE")
+    else mkdir -p -- "$STATE"; STATE_CREATED=true; fi
+    STATE_TOUCHED=true
     chown "$uid:$(id -g "$user")" "$STATE"; chmod 700 "$STATE"
     runuser -u "$user" -- test -r "$CONFIG/webhook"
     runuser -u "$user" -- test -x "$CONFIG/alert.sh"
@@ -175,9 +183,9 @@ manager_main() {
     fi
     if [[ $update == true && -f $CRON && $refresh == false ]]; then
         # Only replace the old interpreter invocation; retain schedule and lock.
-        sed -e 's@/usr/bin/python3 -I /etc/imunify-discord/scan.py@/bin/bash /etc/imunify-discord/scan.sh@g' \
-            -e 's@/usr/bin/python3 /etc/imunify-discord/scan.py@/bin/bash /etc/imunify-discord/scan.sh@g' "$CRON" > "$BACKUP/new-cron"
-        if grep -q '/etc/imunify-discord/scan.py' "$BACKUP/new-cron"; then error 'Unknown legacy scan invocation; review cron before switching to Bash.'; return 1; fi
+        sed -e 's@/usr/bin/python3 -I /etc/imunify-discord/scan\.py@/bin/bash /etc/imunify-discord/scan.sh@g' \
+            -e 's@/usr/bin/python3 /etc/imunify-discord/scan\.py@/bin/bash /etc/imunify-discord/scan.sh@g' "$CRON" > "$BACKUP/new-cron"
+        if grep -Fq '/etc/imunify-discord/scan.py' "$BACKUP/new-cron"; then error 'Unknown legacy scan invocation; review cron before switching to Bash.'; return 1; fi
     else
         printf '# Managed by imunify-discord; use --refresh-cron to apply schedule changes.\nSHELL=/bin/sh\nPATH=/usr/sbin:/usr/bin:/sbin:/bin\n%s root /usr/bin/flock -n /run/imunify-discord-scan.lock /bin/bash /etc/imunify-discord/scan.sh\n' "$SCAN_CRON" > "$BACKUP/new-cron"
     fi

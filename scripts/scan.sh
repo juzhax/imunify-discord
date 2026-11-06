@@ -2,6 +2,7 @@
 set +x
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+# shellcheck source=scripts/common.sh
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 read_config "$CONFIG/config.env"
 AGENT=$(< "$CONFIG/agent")

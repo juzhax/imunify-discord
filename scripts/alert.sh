@@ -3,6 +3,7 @@ set +x
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 ALERT_BASE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/common.sh
 source "$ALERT_BASE/common.sh"
 FILTER=$ALERT_BASE/alert.jq
 
@@ -42,7 +43,7 @@ cache_open() {
 }
 
 alert_main() {
-    local test_mode= event_type key duplicate cache=false
+    local test_mode='' event_type key duplicate cache=false
     local -a keys=()
     case ${1:-} in
         '') (($#==0)) || return 1;;
